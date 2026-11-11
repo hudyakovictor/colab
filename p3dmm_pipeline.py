@@ -137,7 +137,7 @@ DEFAULT_CONFIG = {
     "use_flame2023": "true",
     "torch_compile": False,
     "sync_to_drive": True,
-    "single_iters": 400,
+    "single_iters": 200,
     "attempts": 3,
     "min_free_gb": 2.0,
     "session_max_hours": 12.0,
