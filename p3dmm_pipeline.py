@@ -145,7 +145,7 @@ DEFAULT_CONFIG = {
     "batch_timeout_min": 90,
     "keep_preproc": True,
     "unit": "photo",
-    "photos_per_chunk": 40,
+    "photos_per_chunk": 1,
     "max_photos_per_run": 500,
     "photo_timeout_min": 15,
     "keep_archive": False,
@@ -1224,8 +1224,9 @@ def photo_names(rows):
     return {frame: (f"{name}__{frame}" if counts[name] > 1 else name) for frame, name in base.items()}
 
 
-def overlay_frame(video, dst_jpg, index):
-    """Кадр из result.mp4 (меш поверх лица) в JPG — качество смотрят без проигрывателя."""
+def overlay_frame(video, dst_jpg, index, target_size=None):
+    """Сохраняет только центральную панель (оригинал + наложенный меш) из трёхпанельного кадра.
+    Размер результата задаётся исходным фото, если оно доступно."""
     try:
         import cv2
     except ImportError:
@@ -1236,7 +1237,16 @@ def overlay_frame(video, dst_jpg, index):
         ok, image = capture.read()
     finally:
         capture.release()
-    return bool(ok) and image is not None and bool(cv2.imwrite(str(dst_jpg), image))
+    if not ok or image is None:
+        return False
+    h, w = image.shape[:2]
+    # Pixel3DMM composes three equal panels side-by-side; take the middle, model-overlay view.
+    if w >= h * 2.4:
+        left, right = w // 3, (2 * w) // 3
+        image = image[:, left:right]
+    if target_size and target_size[0] > 0 and target_size[1] > 0:
+        image = cv2.resize(image, tuple(map(int, target_size)), interpolation=cv2.INTER_AREA)
+    return bool(cv2.imwrite(str(dst_jpg), image, [cv2.IMWRITE_JPEG_QUALITY, 95]))
 
 
 def photo_payload(b, row, arrays, index):
@@ -1868,7 +1878,7 @@ def st_preflight(cfg):
     say(f"режим    : source={cfg.get('source', 'drive')} | unit={cfg.get('unit', 'folder')} | "
         f"папки батчей в {batches_root(cfg)} | "
         + (f"на каждое фото: {batches_root(cfg)}/<папка>/photos/<имя файла>/ "
-           f"чанками по {cfg.get('photos_per_chunk', 40)}"
+           "строго по одному фото: полный комплект перед следующим"
            if str(cfg.get('unit', 'folder')) == 'photo' else
            f"результат на фото: {'папка по имени файла' if str(cfg.get('export', 'photos')) != 'bundle' else 'только архив'}"))
     if root is not None and root.is_dir():
@@ -1913,8 +1923,7 @@ def st_plan(cfg):
     unit = str(cfg.get("unit", "folder"))
     if unit == "photo":
         batches = chunk_batches(batches, cfg)
-        say(f"unit=photo: предобработка чанками по <= {cfg.get('photos_per_chunk', 40)} фото, "
-            f"трекинг — отдельно на каждое фото (свой canonical.ply)")
+        say("unit=photo: строго одно фото за цикл — предобработка, трекинг и полный экспорт до следующего фото")
     use2023 = resolve_flame2023(cfg)
     total = sum(b["n"] for b in batches)
     save_plan(cfg, {"batches": batches, "use_flame2023": use2023, "total_photos": total, "config": cfg})
@@ -2239,7 +2248,7 @@ def ensure_staged(b):
 def chunk_batches(batches, cfg):
     """unit=photo: пачка предобработки = чанк не больше photos_per_chunk, а результат всё равно
     лежит в папке исходной папки (b["out"]), чтобы фото не разъезжались по разным местам."""
-    size = max(1, int(cfg.get("photos_per_chunk", 40) or 40))
+    size = 1  # полный цикл каждого фото завершается до начала следующего
     out = []
     for b in batches:
         out_id = b.setdefault("out", b["id"])      # папка результата = исходная папка, а не чанк
@@ -2551,7 +2560,16 @@ def export_photo(cfg, b, item, name, actor, sec, args, use2023):
     for label, src in landmark_artifacts(actor, frame):
         if nonempty_file(src):
             copy_file(src, folder / label)
-    overlay_frame(actor / "result.mp4", folder / "overlay.jpg", 0)
+    target_size = None
+    if source.is_file():
+        try:
+            import cv2
+            original = cv2.imread(str(source))
+            if original is not None:
+                target_size = (original.shape[1], original.shape[0])
+        except ImportError:
+            pass
+    overlay_frame(actor / "result.mp4", folder / "overlay.jpg", 0, target_size)
     payload = photo_payload(b, row, {key: value for key, value in one.items()}, 0)
     payload["unit"] = "photo"
     payload["canonical"] = "canonical.ply"
@@ -2709,9 +2727,7 @@ def run_photos(cfg, plan, batches, use2023):
     say("=" * 72)
     say(f"КОРПУС (unit=photo): фото всего {sum(b['n'] for b in batches)} | готово {total_done} | "
         f"считаем {left} | свободно {free_gb()} ГБ | flame2023={use2023}")
-    say(f"чанков предобработки: {len(work)} по <= {cfg.get('photos_per_chunk', 40)} фото | "
-        f"бюджет сессии {cfg['session_max_hours']} ч, рантайм живёт {session_elapsed_hours():.1f} ч "
-        f"из {cfg['session_hard_limit_hours']} ч | стоп-файл: {STOP_FILE}")
+    say("Обработка строго по одному фото: предобработка → трекинг → полный экспорт на Drive → следующее фото")
     say("=" * 72)
     if not left:
         if gave_up:
@@ -2720,113 +2736,77 @@ def run_photos(cfg, plan, batches, use2023):
             return 1
         say("всё посчитано — ничего не делаем; свежие результаты смотри в status/collect")
         return 0
+
     per_photo = median_sec_per_frame(records.values())
     deadline = session_deadline(cfg)
-    ok_n, fail_n = 0, 0
-    track_queue = []
-    for b, todo in work:
-        if not todo:
-            continue
-        base = PREPRO / b["id"]
-        need = [(item["frame"], name) for item, name, _ in todo]
-        say(f"[чанк {b['id']}] фото {len(todo)} из {b['n']}: готовлю предобработку")
-        progress(phase="Предобработка (кроп, PIPNet, MICA, нормали, UV)", current=b["id"],
-                 stats=f"фото в чанке: {len(todo)} | готово до этого: {total_done}")
-        missing = [f for f, _ in need if not preproc_ok(base, f)]
-        if missing:
-            restored = restore_preproc(cfg, b, [(f, n) for f, n in need if f in missing])
-            missing = [f for f in missing if f not in restored and not preproc_ok(base, f)]
-        if missing:
-            say(f"  предобработка {len(missing)} кадр(ов) (остальные уже в Drive)")
-            try:
-                preprocess_subset(cfg, b, missing)
-            except (RuntimeError, OSError, ValueError) as error:
-                say(f"  FAIL предобработка чанка: {str(error)[:300]}")
-                for item, name, key in todo:
-                    photo_record(cfg, records, b, item, name, key, "fail", err=str(error)[:400])
-                fail_n += 1
-                continue
-        if not count_dirs(base / "mica"):
-            err = f"чанк {b['id']}: MICA не вернул ни одного identity — трекер на этом падает"
-            say(f"  FAIL {err}")
-            for item, name, key in todo:
-                photo_record(cfg, records, b, item, name, key, "fail", err=err)
-            fail_n += 1
-            continue
-        for frame, name in need:
-            if not preproc_ok(base, frame):
-                continue
-            sync_preproc(cfg, b, frame, name)
-        for item, name, key in todo:
-            if not photo_done(photo_dir(cfg, b.get("out", b["id"]), name)):
-                track_queue.append((photo_sort_moment(Path(item.get("orig", ""))) or datetime.min,
-                                    b, item, name, key))
-    track_queue.sort(key=lambda x: (x[0], x[2].get("relpath", "")))
-    progress(phase="Очередь трекинга", current="", completed=0, total=len(track_queue),
-             stats=f"в этой сессии к обработке {len(track_queue)} фото | уже готово {total_done}")
     max_photos = int(cfg.get("max_photos_per_run", 500) or 500)
-    new_attempts = 0
-    stop_run = False
-    for _, b, item, name, key in track_queue:
+    ok_n, fail_n, new_attempts, stop_run = 0, 0, 0, False
+    queue = [(photo_sort_moment(Path(item.get("orig", ""))) or datetime.min,
+              b, item, name, key) for b, todo in work for item, name, key in todo]
+    queue.sort(key=lambda x: (x[0], x[2].get("relpath", "")))
+    for index, (_, b, item, name, key) in enumerate(queue):
         if new_attempts >= max_photos:
-            say(f"лимит запуска: {max_photos} фото за один run — остальное в следующий раз")
-            stop_run = True
+            say(f"лимит запуска: {max_photos} фото — остальное в следующий запуск")
             break
+        if STOP_FILE.exists():
+            say(f"найден {STOP_FILE} — останавливаюсь перед {name}")
+            break
+        if time.time() > deadline:
+            say(f"бюджет сессии исчерпан — стоп перед {name}")
+            break
+        est = (per_photo or float(cfg.get("photo_timeout_min", 15)) * 60) + GUARD_MARGIN_S
+        if est > deadline - time.time():
+            say(f"не начинаю {name}: недостаточно времени по бюджету сессии")
+            break
+
         base = PREPRO / b["id"]
         folder = photo_dir(cfg, b.get("out", b["id"]), name)
         if photo_done(folder):
             continue
-        if not preproc_ok(base, item["frame"]):
-            holes = [p.name for _, p in preproc_files(base, item["frame"], mica=False)
-                     if not nonempty_file(p)]
-            say(f"  {name}: предобработка неполная (нет {', '.join(holes[:4])}) — в журнал пропуском")
-            photo_record(cfg, records, b, item, name, key, "fail",
-                         err="предобработка: нет " + ", ".join(holes[:6]))
-            fail_n += 1
-            continue
-        if STOP_FILE.exists():
-            say(f"найден {STOP_FILE} — останавливаюсь на {name}")
-            stop_run = True
-            break
-        if time.time() > deadline:
-            say(f"бюджет сессии исчерпан — стоп на {name}, жми run ещё раз")
-            stop_run = True
-            break
-        est = (per_photo or float(cfg.get("photo_timeout_min", 15)) * 60) + GUARD_MARGIN_S
-        if est > deadline - time.time():
-            say(f"не начинаю {name}: оценка {human(est)} больше остатка "
-                f"{human(max(deadline - time.time(), 0.0))} — запускай run в свежей среде")
-            stop_run = True
-            break
-        new_attempts += 1
+        frame = item.get("frame", "00000")
+        if not preproc_ok(base, frame):
+            progress(phase="Предобработка фото", current=name,
+                     stats=f"фото {index + 1}/{len(queue)} · до этого полностью готово {total_done + ok_n}")
+            say(f"[фото {index + 1}/{len(queue)}] {name}: предобработка (кроп, PIPNet, MICA, нормали, UV)")
+            restored = restore_preproc(cfg, b, [(frame, name)])
+            if frame not in restored and not preproc_ok(base, frame):
+                try:
+                    preprocess_subset(cfg, b, [frame])
+                except (RuntimeError, OSError, ValueError) as error:
+                    photo_record(cfg, records, b, item, name, key, "fail", err=str(error)[:400])
+                    fail_n += 1
+                    say(f"  {name}: предобработка не удалась: {str(error)[:300]} — останавливаюсь, чтобы не перескакивать фото")
+                    break
+            if not preproc_ok(base, frame):
+                holes = [p.name for _, p in preproc_files(base, frame, mica=False) if not nonempty_file(p)]
+                photo_record(cfg, records, b, item, name, key, "fail", err="предобработка: нет " + ", ".join(holes[:6]))
+                fail_n += 1
+                say(f"  {name}: предобработка не полная — останавливаюсь, чтобы не перескакивать фото")
+                break
+            sync_preproc(cfg, b, frame, name)
+
+        progress(phase="Трекинг фото", current=name,
+                 stats=f"фото {index + 1}/{len(queue)} · полностью готово {total_done + ok_n} · осталось {len(queue)-index}")
+        say(f"[фото {index + 1}/{len(queue)}] {name}: трекинг и экспорт")
         write_resume(current=item.get("relpath", name))
-        left_now = max(0, left - ok_n - fail_n)
-        progress(phase="Трекинг фото", current=name, completed=ok_n + fail_n, total=len(track_queue),
-                 stats=f"ok {ok_n} | fail {fail_n} | осталось {left_now}"
-                       + (f" | ~{human(per_photo * left_now)}" if per_photo else ""))
+        new_attempts += 1
         status, err, sec, args, extra = process_photo(cfg, b, item, name, use2023)
         photo_record(cfg, records, b, item, name, key, status, err=err, sec=sec,
                      args_text=" ".join(args), extra=dict(extra, canonical=status == "ok"))
-        progress(phase="Трекинг фото", current=name, completed=ok_n + fail_n, total=len(track_queue),
-                 stats=f"ok {ok_n} | fail {fail_n} | последнее фото: {human(sec)}")
         if status == "ok":
             ok_n += 1
-            done_here = 0
+            total_done += 1
             per_photo = per_photo or sec
-            left_now = left - ok_n - fail_n
-            write_resume(completed=item.get("relpath", name),
-                        nxt=next((x[2].get("relpath", x[3]) for x in track_queue
-                                  if x[2].get("relpath", x[3]) != item.get("relpath", name)), ""))
-            say(f"  {name} -> ok за {human(sec)} | осталось {left_now} фото "
-                f"(~{human(per_photo * left_now) if per_photo else '?'})")
+            write_resume(completed=item.get("relpath", name))
+            say(f"  {name} → полный комплект сохранён на Drive за {human(sec)}")
         else:
             fail_n += 1
-            say(f"  {name} -> fail за {human(sec)} | {err[:200]}")
-            if "таймаут" in err or free_gb() < float(cfg["min_free_gb"]):
-                stop_run = True
-                break
-    if stop_run:
-        pass
+            say(f"  {name} → ошибка за {human(sec)}: {err[:200]}")
+            # Не переходить к следующему фото: пользователь просил завершать комплекты строго по очереди.
+            break
+    save_plan(cfg, plan)
+    say("-" * 72)
+    say(f"сессия: полностью готово {ok_n} | провалов {fail_n}; готовые папки с done.json пропускаются")
     save_plan(cfg, plan)
     say("-" * 72)
     say(f"сессия: ok {ok_n} | провалов {fail_n}. Жми ту же ячейку run — посчитанные фото пропускаются "

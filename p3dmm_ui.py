@@ -512,7 +512,7 @@ CONFIG_BASE = {
     "batch_timeout_min": 90,
     "keep_preproc": True,
     "unit": "photo",
-    "photos_per_chunk": 40,
+    "photos_per_chunk": 1,
     "max_photos_per_run": 500,
     "photo_timeout_min": 15,
     "keep_archive": False,
